@@ -1,0 +1,13 @@
+.venv/
+__pycache__/
+.tmp/
+*.pyc
+*.pyo
+*.pyd
+
+results.json
+results.jsonl
+crawler.checkpoint.json
+
+.DS_Store
+Thumbs.db
