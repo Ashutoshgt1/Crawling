@@ -6,6 +6,16 @@ This repo now has a build-first platform starter around the existing Playwright 
 
 - `crawler.py`
   Current single-node search-result crawler and metadata extractor.
+- `distributed_crawler/`
+  Shared core for the new distributed crawler stack.
+- `services/frontier/main.py`
+  Frontier seed and control entry point.
+- `services/scheduler/main.py`
+  Scheduler and host-budget entry point.
+- `workers/http_fetch/main.py`
+  Async high-throughput HTTP fetch worker.
+- `workers/browser_fetch/main.py`
+  Browser escalation worker placeholder for Playwright-only promoted URLs.
 - `docker-compose.yml`
   Local infrastructure stack for the next stage of development.
 - `sql/001_init.sql`
@@ -35,11 +45,12 @@ This repo now has a build-first platform starter around the existing Playwright 
 1. Start infrastructure with `docker compose up -d`.
 2. Postgres auto-loads the SQL schema from `sql/001_init.sql`.
 3. Keep using `crawler.py` for data collection while building the platform services.
-4. Next services to add:
-   - `frontier-service`
-   - `scheduler-service`
-   - `parse-service`
-   - `resolver-service`
+4. Primary code path to extend:
+   - frontier service
+   - scheduler service
+   - HTTP fetch workers
+   - browser fetch workers
+   - parser / resolver logic
 
 ## Recommended service split
 
@@ -57,11 +68,21 @@ This repo now has a build-first platform starter around the existing Playwright 
 ## First production-grade loop
 
 1. Seed URLs enter `urls` with state `ready`.
-2. Scheduler leases `ready` URLs by host/domain budget.
-3. Fetchers write raw artifacts and `fetch_results`.
-4. Parser emits `observations` plus discovered child URLs.
-5. Resolver merges observations into `companies`.
-6. Recrawl planner updates `next_fetch_at`.
+2. Frontier leases work in batches.
+3. Scheduler constrains lease execution by host/domain budget.
+4. Async HTTP workers fetch the majority path and store raw HTML.
+5. If Kafka is enabled, fetch workers emit fetch events and parser/resolver stages run independently.
+6. Parser emits `observations` plus discovered child URLs and important-page hints.
+7. Resolver merges observations into `companies` with confidence-aware field preservation.
+8. Browser workers are reserved for URLs promoted by scheduler policy.
+
+## Accuracy strategy
+
+- Prefer official-site observations over weak generic pages.
+- Extract across page families such as `about`, `contact`, `leadership`, and `locations`.
+- Preserve provenance in `observations` and merge into `companies` with confidence details.
+- Promote hard or JS-dependent hosts to browser mode through `domain_state`.
+- Weight field selection by page type so contact/about evidence wins over generic homepages when values conflict.
 
 ## Priority guidance
 

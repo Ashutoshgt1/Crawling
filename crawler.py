@@ -67,6 +67,9 @@ GENERIC_COMPANY_NAME_CANDIDATES = {
     "innovation",
     "our businesses",
     "sign in",
+    "home",
+    "homepage",
+    "welcome",
 }
 GENERIC_SOCIAL_PATHS = {
     "",
@@ -439,9 +442,33 @@ def build_brand_domain_mapping(domain: str, company_name: str | None) -> dict[st
     }
 
 
+def normalize_company_name_candidate(candidate: str | None) -> str | None:
+    cleaned = normalize_whitespace(candidate)
+    if not cleaned:
+        return None
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" |:-")
+    cleaned = re.sub(r"\bOfficial Website\b", "", cleaned, flags=re.IGNORECASE).strip(" |:-")
+    cleaned = re.sub(r"\bHome Page\b", "", cleaned, flags=re.IGNORECASE).strip(" |:-")
+    if cleaned.lower().endswith(" corporate"):
+        cleaned = cleaned[:-10].strip(" |:-")
+    return cleaned or None
+
+
+def title_company_name_candidates(title: str | None) -> list[str]:
+    cleaned_title = normalize_whitespace(title)
+    if not cleaned_title:
+        return []
+    parts = [normalize_company_name_candidate(part) for part in re.split(r"\s+[|\-–]\s+|\|", cleaned_title)]
+    ordered_parts: list[str] = []
+    for part in parts:
+        if part and part not in ordered_parts:
+            ordered_parts.append(part)
+    return ordered_parts
+
+
 def pick_company_name(candidates: list[str | None]) -> str | None:
     for candidate in candidates:
-        cleaned = normalize_whitespace(candidate)
+        cleaned = normalize_company_name_candidate(candidate)
         if is_strong_company_name(cleaned):
             return cleaned
     return None
@@ -575,7 +602,7 @@ def build_empty_company_profile() -> dict[str, Any]:
 
 
 def is_strong_company_name(candidate: str | None) -> bool:
-    cleaned = normalize_whitespace(candidate)
+    cleaned = normalize_company_name_candidate(candidate)
     if not cleaned:
         return False
     lowered = cleaned.lower()
@@ -585,6 +612,10 @@ def is_strong_company_name(candidate: str | None) -> bool:
         phrase in lowered
         for phrase in (" careers", " jobs", "join us", "with you", "& you", "welcome to", "sign in")
     ):
+        return False
+    if len(cleaned.split()) >= 4 and cleaned == cleaned.upper():
+        return False
+    if lowered.startswith(("from ", "our ", "welcome ", "discover ", "explore ")):
         return False
     if len(cleaned) < 3:
         return False
@@ -936,7 +967,9 @@ async def fetch_page_metadata(
         domain = urlsplit(final_url).netloc
         page_text = metadata.get("body_text") or ""
         focused_text_blocks = metadata.get("focused_text_blocks") or []
-        company_name = pick_company_name(metadata.get("company_name_candidates") or [])
+        company_name_candidates = list(metadata.get("company_name_candidates") or [])
+        company_name_candidates.extend(title_company_name_candidates(metadata.get("title")))
+        company_name = pick_company_name(company_name_candidates)
         schema_addresses = unique_nonempty(metadata.get("schema_addresses") or [])
         description = pick_best_description(metadata.get("description_candidates") or [])
         business_metadata = build_business_metadata(

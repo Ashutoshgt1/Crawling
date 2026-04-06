@@ -51,6 +51,84 @@ Core local endpoints:
 The initial relational schema is in [sql/001_init.sql](sql/001_init.sql).
 The platform blueprint is in [docs/architecture.md](docs/architecture.md).
 
+## First Service Loop
+
+The repo now includes the first production-shaped loop for:
+
+- frontier seeding
+- scheduler leasing
+- HTML fetch + raw artifact storage in MinIO
+- parser extraction
+- observation write + company resolution in Postgres
+
+New package:
+
+- `crawler_platform/`
+
+New scripts:
+
+- `python scripts/seed_urls.py --input seeds.txt`
+- `python scripts/run_scheduler.py --batch-size 10`
+
+Expected environment values are listed in `.env.example`.
+
+Typical local flow:
+
+```powershell
+.\scripts\bootstrap-dev.ps1
+python -m pip install -r requirements.txt
+python scripts/seed_urls.py --input seeds.txt
+python scripts/run_scheduler.py --batch-size 10
+```
+
+What this loop does:
+
+1. inserts seed URLs into the `urls` frontier table
+2. leases ready URLs from Postgres
+3. fetches HTML over HTTP
+4. stores raw HTML in MinIO
+5. extracts links and a starter company observation
+6. writes observations and resolves into `companies`
+
+## Distributed Crawler Shape
+
+The real large-scale path in this repo is now:
+
+- `services/frontier/main.py`
+- `services/scheduler/main.py`
+- `workers/http_fetch/main.py`
+- `workers/browser_fetch/main.py`
+- `services/parser_resolver/main.py`
+- `distributed_crawler/shared/`
+
+This is the intended direction for the 1 crore company architecture:
+
+- frontier owns URL state, leasing, and priority
+- scheduler owns host/domain budgets and render-path decisions
+- HTTP workers handle the high-throughput majority path
+- browser workers are only for promoted URLs
+- parser/resolver maximizes data extraction and writes canonical company records
+
+Starter commands:
+
+```powershell
+python services/frontier/main.py --input seeds.txt
+python services/scheduler/main.py --batch-size 100 --render-mode http
+python workers/http_fetch/main.py --batch-size 100 --concurrency 20
+python services/parser_resolver/main.py --mode parse
+python services/parser_resolver/main.py --mode resolve
+python workers/browser_fetch/main.py
+```
+
+Important:
+
+- `crawler.py` remains as a legacy utility crawler
+- the new `distributed_crawler/` + `services/` + `workers/` layout is the architecture path to continue building
+- set `KAFKA_ENABLED=true` to split fetch, parse, and resolve into separate stages
+- scheduler now applies host-aware selection before leasing and promotes risky hosts to the browser queue
+- parser now prioritizes important company pages and extracts richer fields such as addresses, socials, contact links, and page types
+- resolver now prefers stronger same-domain evidence from `contact`, `about`, and `leadership` pages over generic pages when selecting company fields
+
 ## Setup
 
 ```powershell
