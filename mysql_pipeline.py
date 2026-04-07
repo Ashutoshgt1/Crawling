@@ -2,6 +2,7 @@ import argparse
 import asyncio
 import json
 import os
+import random
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -60,9 +61,28 @@ ORG_HINTS = (
     "agency",
     "associates",
 )
+PARENTHETICAL_NOISE_TERMS = (
+    "online tickets booking",
+    "ticket booking",
+    "booking",
+    "online booking",
+)
 
 
 NUMBERED_ITEM_RE = re.compile(r"(?:^|\s)(\d+)\)\s*")
+BLOCK_SIGNAL_PATTERNS = (
+    "captcha",
+    "recaptcha",
+    "sorry",
+    "forbidden",
+    "access denied",
+    "blocked",
+    "verify you are human",
+    "unusual traffic",
+    "temporarily unavailable",
+    "sign in",
+    "robot",
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -83,6 +103,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--headful", action="store_true")
     parser.add_argument("--channel", default="msedge")
     parser.add_argument("--proxy-file", default=None)
+    parser.add_argument("--min-delay-seconds", type=float, default=4.0)
+    parser.add_argument("--max-delay-seconds", type=float, default=9.0)
+    parser.add_argument("--batch-size", type=int, default=5)
+    parser.add_argument("--batch-cooldown-seconds", type=float, default=45.0)
+    parser.add_argument("--block-cooldown-seconds", type=float, default=180.0)
+    parser.add_argument("--session-max-queries", type=int, default=4)
+    parser.add_argument("--stop-block-rate", type=float, default=0.20)
+    parser.add_argument("--min-processed-for-block-guard", type=int, default=10)
+    parser.add_argument(
+        "--rotate-engines",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Alternate the primary/fallback engine order across queries when both are available.",
+    )
     parser.add_argument(
         "--resume",
         action=argparse.BooleanOptionalAction,
@@ -121,6 +155,13 @@ def open_connection(settings: MysqlSettings) -> MySQLConnection:
 def normalize_segment(value: str) -> str:
     cleaned = re.sub(r"\s+", " ", value).strip(" ,;:-")
     cleaned = re.sub(r"^(?:m/s|m\.s\.)\s+", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(
+        r"\(([^)]*)\)",
+        lambda match: ""
+        if any(term in match.group(1).lower() for term in PARENTHETICAL_NOISE_TERMS)
+        else match.group(0),
+        cleaned,
+    )
     return cleaned.strip(" ,;:-")
 
 
@@ -183,6 +224,71 @@ def derive_search_company_name(raw_company_name: str, matched_keyword: str | Non
     )
     best = ranked[0]
     return best
+
+
+def choose_engines(
+    query_index: int,
+    primary_engine: str,
+    fallback_engine: str | None,
+    rotate_engines: bool,
+) -> tuple[str, str | None]:
+    if not fallback_engine or not rotate_engines:
+        return primary_engine, fallback_engine
+    if query_index % 2 == 1:
+        return fallback_engine, primary_engine
+    return primary_engine, fallback_engine
+
+
+def infer_record_status(record: dict[str, Any]) -> tuple[str, str | None]:
+    status = record.get("status") or "failed"
+    details = " | ".join(
+        str(value)
+        for value in (
+            record.get("error"),
+            record.get("note"),
+        )
+        if value
+    )
+    combined_text_parts = [details.lower()] if details else []
+    blocked_hits = 0
+
+    for result in record.get("results") or []:
+        title = str(result.get("title") or "")
+        final_url = str((result.get("metadata") or {}).get("final_url") or result.get("url") or "")
+        haystack = f"{title} {final_url}".lower()
+        combined_text_parts.append(haystack)
+        if any(pattern in haystack for pattern in BLOCK_SIGNAL_PATTERNS):
+            blocked_hits += 1
+
+    combined_text = " ".join(combined_text_parts)
+    if any(pattern in combined_text for pattern in BLOCK_SIGNAL_PATTERNS):
+        return "blocked", details or "Detected blocking or challenge indicators in search/fetch results."
+    if status == "ok" and not (record.get("results") or []):
+        return "failed", details or "Search completed but produced no result URLs."
+    return status, details or None
+
+
+async def build_session(
+    playwright,
+    args: argparse.Namespace,
+    proxies: list[ProxyConfig],
+    session_index: int,
+):
+    proxy = proxies[session_index % len(proxies)] if proxies else None
+    browser = await build_browser(
+        playwright,
+        headless=not args.headful,
+        channel=args.channel,
+        proxy=proxy,
+    )
+    context = await build_context(browser)
+    page = await context.new_page()
+    return browser, context, page, proxy
+
+
+async def close_session(browser, context) -> None:
+    await context.close()
+    await browser.close()
 
 
 def fetch_input_companies(
@@ -268,41 +374,101 @@ async def run_mysql_pipeline(args: argparse.Namespace) -> None:
             return
 
         async with async_playwright() as playwright:
-            proxy: ProxyConfig | None = proxies[0] if proxies else None
-            browser = await build_browser(
-                playwright,
-                headless=not args.headful,
-                channel=args.channel,
-                proxy=proxy,
-            )
-            context = await build_context(browser)
-            page = await context.new_page()
+            browser = None
+            context = None
+            page = None
+            active_proxy: ProxyConfig | None = None
+            session_index = 0
+            session_queries = 0
+            blocked_count = 0
             try:
                 for index, input_company in enumerate(input_companies, start=1):
+                    if page is None or session_queries >= args.session_max_queries:
+                        if browser and context:
+                            await close_session(browser, context)
+                            browser = None
+                            context = None
+                            page = None
+                        browser, context, page, active_proxy = await build_session(
+                            playwright,
+                            args,
+                            proxies,
+                            session_index,
+                        )
+                        session_index += 1
+                        session_queries = 0
+
+                    primary_engine, fallback_engine = choose_engines(
+                        query_index=index,
+                        primary_engine=args.engine,
+                        fallback_engine=args.fallback_engine,
+                        rotate_engines=args.rotate_engines,
+                    )
                     task = QueryTask(query_id=index, query=input_company.search_company_name)
                     record = await process_query(
                         page=page,
                         context=context,
                         task=task,
-                        primary_engine=args.engine,
-                        fallback_engine=args.fallback_engine,
+                        primary_engine=primary_engine,
+                        fallback_engine=fallback_engine,
                         max_retries=args.max_retries,
                     )
+                    status, status_detail = infer_record_status(record)
+                    record["status"] = status
+                    if status_detail:
+                        record["error"] = status_detail
+                    record["engine_primary_requested"] = primary_engine
+                    record["engine_fallback_requested"] = fallback_engine
                     record["input_source"] = {
                         "matched_keyword": input_company.matched_keyword,
                         "raw_company_name": input_company.raw_company_name,
                         "search_company_name": input_company.search_company_name,
                     }
+                    if active_proxy:
+                        record["proxy"] = active_proxy.server
                     save_record(conn, settings, input_company.search_company_name, record)
                     print(
                         f"[mysql-pipeline] saved {index}/{len(input_companies)} "
                         f"raw={input_company.raw_company_name!r} "
                         f"search={input_company.search_company_name!r} "
-                        f"status={record['status']}"
+                        f"status={record['status']} "
+                        f"engine={primary_engine}"
                     )
+                    session_queries += 1
+                    if record["status"] == "blocked":
+                        blocked_count += 1
+                        if browser and context:
+                            await close_session(browser, context)
+                            browser = None
+                            context = None
+                            page = None
+                        await asyncio.sleep(args.block_cooldown_seconds)
+                    else:
+                        await asyncio.sleep(
+                            random.uniform(args.min_delay_seconds, args.max_delay_seconds)
+                        )
+
+                    if (
+                        index >= args.min_processed_for_block_guard
+                        and index > 0
+                        and (blocked_count / index) >= args.stop_block_rate
+                    ):
+                        print(
+                            "[mysql-pipeline] stopping early because the block rate "
+                            f"reached {blocked_count}/{index} ({blocked_count / index:.0%})."
+                        )
+                        break
+
+                    if index % args.batch_size == 0:
+                        if browser and context:
+                            await close_session(browser, context)
+                            browser = None
+                            context = None
+                            page = None
+                        await asyncio.sleep(args.batch_cooldown_seconds)
             finally:
-                await context.close()
-                await browser.close()
+                if browser and context:
+                    await close_session(browser, context)
     finally:
         conn.close()
 

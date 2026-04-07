@@ -153,6 +153,31 @@ What it does:
 3. crawls each company name using the current Playwright crawler flow
 4. inserts `(company_name, json)` into `master.bharatfleet_data`
 
+Recommended guarded batch for search-driven crawling:
+
+```powershell
+.\.venv\Scripts\python.exe mysql_pipeline.py `
+  --host 192.168.1.133 `
+  --port 3306 `
+  --user crawler `
+  --password "YOUR_PASSWORD" `
+  --database master `
+  --input-table filtered_bharatfleet `
+  --output-table bharatfleet_data `
+  --engine google `
+  --fallback-engine duckduckgo `
+  --limit 20 `
+  --min-delay-seconds 4 `
+  --max-delay-seconds 9 `
+  --batch-size 5 `
+  --batch-cooldown-seconds 45 `
+  --block-cooldown-seconds 180 `
+  --session-max-queries 4 `
+  --stop-block-rate 0.20
+```
+
+These controls reduce block risk by rotating search engines, refreshing browser sessions, adding jitter between queries, cooling down between batches, and stopping early if challenge/block signals rise too much.
+
 ## Setup
 
 ```powershell
