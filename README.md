@@ -129,6 +129,30 @@ Important:
 - parser now prioritizes important company pages and extracts richer fields such as addresses, socials, contact links, and page types
 - resolver now prefers stronger same-domain evidence from `contact`, `about`, and `leadership` pages over generic pages when selecting company fields
 
+## MySQL Integration
+
+You can read input company names from MySQL and save crawler output JSON back into MySQL with:
+
+```powershell
+.\.venv\Scripts\python.exe mysql_pipeline.py `
+  --host 192.168.1.133 `
+  --port 3306 `
+  --user crawler `
+  --password "YOUR_PASSWORD" `
+  --database master `
+  --input-table filtered_bharatfleet `
+  --output-table bharatfleet_data `
+  --engine google `
+  --fallback-engine duckduckgo
+```
+
+What it does:
+
+1. reads `company_name` from `master.filtered_bharatfleet`
+2. skips names already present in `master.bharatfleet_data` when `--resume` is enabled
+3. crawls each company name using the current Playwright crawler flow
+4. inserts `(company_name, json)` into `master.bharatfleet_data`
+
 ## Setup
 
 ```powershell

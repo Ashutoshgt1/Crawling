@@ -629,6 +629,122 @@ def is_likely_official_url(url: str) -> bool:
     return classify_domain(domain) == "likely_official"
 
 
+def classify_important_page(url: str) -> str | None:
+    lowered_url = url.lower()
+    for page_type, keywords in IMPORTANT_PAGE_KEYWORDS.items():
+        if any(keyword in lowered_url for keyword in keywords):
+            return page_type
+    return None
+
+
+def score_company_name_candidate(result_item: dict[str, Any]) -> tuple[int, str | None]:
+    metadata = result_item.get("metadata", {})
+    business = metadata.get("business", {})
+    final_url = metadata.get("final_url") or result_item.get("url") or ""
+    if not is_likely_official_url(final_url):
+        return (-1, None)
+
+    candidate = normalize_company_name_candidate(business.get("company_name"))
+    if not is_strong_company_name(candidate):
+        return (-1, None)
+
+    parsed = urlsplit(final_url)
+    page_type = classify_important_page(final_url)
+    title = normalize_whitespace(result_item.get("title"))
+
+    score = 0
+    if parsed.path in {"", "/"}:
+        score += 100
+    elif page_type == "about":
+        score += 90
+    elif page_type == "contact":
+        score += 85
+    elif page_type == "leadership":
+        score += 75
+    elif page_type == "careers":
+        score += 45
+    else:
+        score += 60
+
+    if title and candidate.lower() in title.lower():
+        score += 20
+    if len(candidate) <= 30:
+        score += 5
+    if any(token in candidate for token in ("&", ".", "-")):
+        score += 3
+
+    return (score, candidate)
+
+
+def repair_result_item_company_name(result_item: dict[str, Any]) -> None:
+    metadata = result_item.get("metadata", {})
+    business = metadata.get("business", {})
+    existing = business.get("company_name")
+    if is_strong_company_name(existing):
+        business["company_name"] = normalize_company_name_candidate(existing)
+        business["brand_domain_mapping"] = build_brand_domain_mapping(
+            metadata.get("domain") or urlsplit(metadata.get("final_url") or result_item.get("url") or "").netloc,
+            business["company_name"],
+        )
+        return
+
+    title_candidates = title_company_name_candidates(result_item.get("title"))
+    repaired = pick_company_name(title_candidates)
+    if repaired:
+        business["company_name"] = repaired
+        business["brand_domain_mapping"] = build_brand_domain_mapping(
+            metadata.get("domain") or urlsplit(metadata.get("final_url") or result_item.get("url") or "").netloc,
+            repaired,
+        )
+
+
+def recompute_company_profile(record: dict[str, Any]) -> None:
+    results = record.get("results") or []
+    for item in results:
+        repair_result_item_company_name(item)
+
+    profile = build_empty_company_profile()
+    best_company_name: str | None = None
+    best_company_name_score = -1
+    for item in results:
+        merge_company_profile(profile, item)
+        score, candidate = score_company_name_candidate(item)
+        if candidate and score > best_company_name_score:
+            best_company_name = candidate
+            best_company_name_score = score
+
+    if best_company_name:
+        profile["company_name"] = best_company_name
+
+    existing_profile = record.get("company_profile") or {}
+    if existing_profile.get("company_summary") and not profile.get("company_summary"):
+        profile["company_summary"] = existing_profile["company_summary"]
+    record["company_profile"] = profile
+
+
+def repair_output_files(output_path: Path, summary_output_path: Path | None) -> None:
+    records = list(iter_jsonl_records(output_path))
+    if not records:
+        print(f"No records found in {output_path}. Nothing to repair.")
+        return
+
+    for record in records:
+        recompute_company_profile(record)
+
+    output_path.write_text(
+        "".join(json.dumps(record, ensure_ascii=False) + "\n" for record in records),
+        encoding="utf-8",
+    )
+
+    if summary_output_path:
+        summary_output_path.write_text(
+            json.dumps(records, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+
+    print(f"Repaired company names in {len(records)} records.")
+
+
 def merge_company_profile(
     profile: dict[str, Any],
     result_item: dict[str, Any],
@@ -658,18 +774,12 @@ def merge_company_profile(
             profile["official_website"] = final_url
         if not profile["primary_domain"] and domain:
             profile["primary_domain"] = domain
-        company_name = business.get("company_name")
-        if not profile["company_name"] and is_strong_company_name(company_name):
-            profile["company_name"] = company_name
         if not profile["company_summary"]:
             profile["company_summary"] = pick_company_summary(metadata.get("description"))
 
-        lowered_url = final_url.lower()
-        for page_type, keywords in IMPORTANT_PAGE_KEYWORDS.items():
-            if page_type in profile["important_pages"]:
-                continue
-            if any(keyword in lowered_url for keyword in keywords):
-                profile["important_pages"][page_type] = final_url
+        page_type = classify_important_page(final_url)
+        if page_type and page_type not in profile["important_pages"]:
+            profile["important_pages"][page_type] = final_url
 
     return profile
 
@@ -1045,8 +1155,17 @@ async def build_result_items_and_profile(
     ordered_results = [result_by_url[url] for url in urls if url in result_by_url]
 
     profile = build_empty_company_profile()
+    best_company_name: str | None = None
+    best_company_name_score = -1
     for item in ordered_results:
         merge_company_profile(profile, item)
+        score, candidate = score_company_name_candidate(item)
+        if candidate and score > best_company_name_score:
+            best_company_name = candidate
+            best_company_name_score = score
+
+    if best_company_name:
+        profile["company_name"] = best_company_name
 
     return ordered_results, profile
 
@@ -1215,6 +1334,10 @@ async def run_crawler(args: argparse.Namespace) -> None:
     summary_output_path = Path(args.summary_output) if args.summary_output else None
     proxy_file = Path(args.proxy_file) if args.proxy_file else None
 
+    if args.repair_output:
+        repair_output_files(output_path, summary_output_path)
+        return
+
     if not input_path.exists():
         raise FileNotFoundError(f"Input file not found: {input_path}")
 
@@ -1360,6 +1483,11 @@ def parse_args() -> argparse.Namespace:
         "--channel",
         default="msedge",
         help="Preferred Chromium channel to launch, for example msedge or chrome.",
+    )
+    parser.add_argument(
+        "--repair-output",
+        action="store_true",
+        help="Recompute company names and company profiles from existing output files without crawling.",
     )
     return parser.parse_args()
 

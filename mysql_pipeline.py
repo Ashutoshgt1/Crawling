@@ -1,0 +1,316 @@
+import argparse
+import asyncio
+import json
+import os
+import re
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+import mysql.connector
+from mysql.connector import MySQLConnection
+from playwright.async_api import async_playwright
+
+from crawler import (
+    ProxyConfig,
+    QueryTask,
+    build_browser,
+    build_context,
+    load_proxies,
+    process_query,
+)
+
+
+@dataclass
+class MysqlSettings:
+    host: str
+    port: int
+    user: str
+    password: str
+    database: str
+    input_table: str
+    output_table: str
+
+
+@dataclass
+class InputCompany:
+    matched_keyword: str | None
+    raw_company_name: str
+    search_company_name: str
+
+
+ORG_HINTS = (
+    "private limited",
+    "pvt ltd",
+    "limited",
+    "llp",
+    "transport",
+    "roadways",
+    "travels",
+    "cargo",
+    "logistics",
+    "packers",
+    "movers",
+    "express",
+    "enterprise",
+    "enterprises",
+    "solutions",
+    "corporation",
+    "corp",
+    "agency",
+    "associates",
+)
+
+
+NUMBERED_ITEM_RE = re.compile(r"(?:^|\s)(\d+)\)\s*")
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Read company_name values from MySQL and save crawler JSON output back to MySQL."
+    )
+    parser.add_argument("--host", default=os.getenv("MYSQL_HOST", "192.168.1.133"))
+    parser.add_argument("--port", type=int, default=int(os.getenv("MYSQL_PORT", "3306")))
+    parser.add_argument("--user", default=os.getenv("MYSQL_USER", "crawler"))
+    parser.add_argument("--password", default=os.getenv("MYSQL_PASSWORD", ""))
+    parser.add_argument("--database", default=os.getenv("MYSQL_DATABASE", "master"))
+    parser.add_argument("--input-table", default=os.getenv("MYSQL_INPUT_TABLE", "filtered_bharatfleet"))
+    parser.add_argument("--output-table", default=os.getenv("MYSQL_OUTPUT_TABLE", "bharatfleet_data"))
+    parser.add_argument("--limit", type=int, default=None, help="Maximum number of company names to process.")
+    parser.add_argument("--engine", choices=("google", "duckduckgo"), default="google")
+    parser.add_argument("--fallback-engine", choices=("google", "duckduckgo"), default="duckduckgo")
+    parser.add_argument("--max-retries", type=int, default=3)
+    parser.add_argument("--headful", action="store_true")
+    parser.add_argument("--channel", default="msedge")
+    parser.add_argument("--proxy-file", default=None)
+    parser.add_argument(
+        "--resume",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Skip company names already present in the output table.",
+    )
+    return parser.parse_args()
+
+
+def build_mysql_settings(args: argparse.Namespace) -> MysqlSettings:
+    if not args.password:
+        raise ValueError(
+            "MySQL password is required. Pass --password or set MYSQL_PASSWORD in the environment."
+        )
+    return MysqlSettings(
+        host=args.host,
+        port=args.port,
+        user=args.user,
+        password=args.password,
+        database=args.database,
+        input_table=args.input_table,
+        output_table=args.output_table,
+    )
+
+
+def open_connection(settings: MysqlSettings) -> MySQLConnection:
+    return mysql.connector.connect(
+        host=settings.host,
+        port=settings.port,
+        user=settings.user,
+        password=settings.password,
+        database=settings.database,
+    )
+
+
+def normalize_segment(value: str) -> str:
+    cleaned = re.sub(r"\s+", " ", value).strip(" ,;:-")
+    cleaned = re.sub(r"^(?:m/s|m\.s\.)\s+", "", cleaned, flags=re.IGNORECASE)
+    return cleaned.strip(" ,;:-")
+
+
+def split_numbered_companies(raw_company_name: str) -> list[str]:
+    matches = list(NUMBERED_ITEM_RE.finditer(raw_company_name))
+    if len(matches) < 2:
+        return [raw_company_name]
+
+    segments: list[str] = []
+    for index, match in enumerate(matches):
+        start = match.end()
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(raw_company_name)
+        segment = normalize_segment(raw_company_name[start:end])
+        if segment:
+            segments.append(segment)
+    return segments or [raw_company_name]
+
+
+def split_candidate_segments(raw_company_name: str) -> list[str]:
+    numbered_segments = split_numbered_companies(raw_company_name)
+    segments: list[str] = []
+    for numbered_segment in numbered_segments:
+        parts = [
+            normalize_segment(part)
+            for part in re.split(r"[,\n;]+", numbered_segment)
+            if normalize_segment(part)
+        ]
+        segments.extend(parts or [normalize_segment(numbered_segment)])
+    return [segment for segment in segments if segment]
+
+
+def score_segment(segment: str, matched_keyword: str | None) -> int:
+    lowered = segment.lower()
+    is_bare_domain = "." in segment and " " not in segment
+    score = 0
+    if matched_keyword and matched_keyword.lower() in lowered:
+        score += 100
+    if any(hint in lowered for hint in ORG_HINTS):
+        score += 25
+    if "private limited" in lowered or "limited" in lowered:
+        score += 15
+    if len(segment.split()) <= 1:
+        score -= 10
+    if is_bare_domain:
+        score -= 90
+    if re.fullmatch(r"[A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3}", segment):
+        score -= 20
+    return score
+
+
+def derive_search_company_name(raw_company_name: str, matched_keyword: str | None) -> str:
+    segments = split_candidate_segments(raw_company_name)
+    if not segments:
+        return normalize_segment(raw_company_name)
+
+    ranked = sorted(
+        segments,
+        key=lambda segment: (score_segment(segment, matched_keyword), len(segment)),
+        reverse=True,
+    )
+    best = ranked[0]
+    return best
+
+
+def fetch_input_companies(
+    conn: MySQLConnection,
+    settings: MysqlSettings,
+    limit: int | None,
+    resume: bool,
+) -> list[InputCompany]:
+    query = f"""
+        SELECT f.matched_keyword, f.company_name
+        FROM {settings.database}.{settings.input_table} f
+        WHERE f.company_name IS NOT NULL
+          AND TRIM(f.company_name) <> ''
+          AND (
+              f.matched_keyword IS NULL
+              OR TRIM(f.matched_keyword) = ''
+              OR LOWER(f.company_name) LIKE CONCAT('%', LOWER(f.matched_keyword), '%')
+          )
+        GROUP BY f.matched_keyword, f.company_name
+        ORDER BY f.company_name
+    """
+    if limit:
+        query += f" LIMIT {int(limit)}"
+
+    existing_outputs: set[str] = set()
+    if resume:
+        with conn.cursor() as cursor:
+            cursor.execute(f"SELECT company_name FROM {settings.database}.{settings.output_table}")
+            existing_outputs = {normalize_segment(row[0]) for row in cursor.fetchall() if row[0]}
+
+    with conn.cursor() as cursor:
+        cursor.execute(query)
+        rows = cursor.fetchall()
+
+    inputs: list[InputCompany] = []
+    seen_search_names: set[str] = set()
+    for matched_keyword, raw_company_name in rows:
+        search_company_name = derive_search_company_name(raw_company_name, matched_keyword)
+        normalized_search_name = normalize_segment(search_company_name)
+        if not normalized_search_name:
+            continue
+        if resume and normalized_search_name in existing_outputs:
+            continue
+        if normalized_search_name in seen_search_names:
+            continue
+        seen_search_names.add(normalized_search_name)
+        inputs.append(
+            InputCompany(
+                matched_keyword=normalize_segment(matched_keyword) if matched_keyword else None,
+                raw_company_name=normalize_segment(raw_company_name),
+                search_company_name=normalized_search_name,
+            )
+        )
+    return inputs
+
+
+def save_record(conn: MySQLConnection, settings: MysqlSettings, company_name: str, record: dict[str, Any]) -> None:
+    payload = json.dumps(record, ensure_ascii=False)
+    status = record.get("status")
+    error_text = record.get("error")
+    query = f"""
+        INSERT INTO {settings.database}.{settings.output_table} (company_name, json, status, error_text, processed_at)
+        VALUES (%s, %s, %s, %s, NOW())
+        ON DUPLICATE KEY UPDATE
+            json = VALUES(json),
+            status = VALUES(status),
+            error_text = VALUES(error_text),
+            processed_at = VALUES(processed_at)
+    """
+    with conn.cursor() as cursor:
+        cursor.execute(query, (company_name, payload, status, error_text))
+    conn.commit()
+
+
+async def run_mysql_pipeline(args: argparse.Namespace) -> None:
+    settings = build_mysql_settings(args)
+    proxies = load_proxies(Path(args.proxy_file)) if args.proxy_file else []
+    conn = open_connection(settings)
+    try:
+        input_companies = fetch_input_companies(conn, settings, args.limit, args.resume)
+        if not input_companies:
+            print("No company names found to process.")
+            return
+
+        async with async_playwright() as playwright:
+            proxy: ProxyConfig | None = proxies[0] if proxies else None
+            browser = await build_browser(
+                playwright,
+                headless=not args.headful,
+                channel=args.channel,
+                proxy=proxy,
+            )
+            context = await build_context(browser)
+            page = await context.new_page()
+            try:
+                for index, input_company in enumerate(input_companies, start=1):
+                    task = QueryTask(query_id=index, query=input_company.search_company_name)
+                    record = await process_query(
+                        page=page,
+                        context=context,
+                        task=task,
+                        primary_engine=args.engine,
+                        fallback_engine=args.fallback_engine,
+                        max_retries=args.max_retries,
+                    )
+                    record["input_source"] = {
+                        "matched_keyword": input_company.matched_keyword,
+                        "raw_company_name": input_company.raw_company_name,
+                        "search_company_name": input_company.search_company_name,
+                    }
+                    save_record(conn, settings, input_company.search_company_name, record)
+                    print(
+                        f"[mysql-pipeline] saved {index}/{len(input_companies)} "
+                        f"raw={input_company.raw_company_name!r} "
+                        f"search={input_company.search_company_name!r} "
+                        f"status={record['status']}"
+                    )
+            finally:
+                await context.close()
+                await browser.close()
+    finally:
+        conn.close()
+
+
+def main() -> None:
+    args = parse_args()
+    asyncio.run(run_mysql_pipeline(args))
+
+
+if __name__ == "__main__":
+    main()
